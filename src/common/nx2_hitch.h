@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <filesystem>
 #include <vector>
 
 #include "common/common_types.h"
@@ -135,6 +136,24 @@ inline void AddLockWait(u64 ns) {
 
 /// Moves up to `max` queued keys for `core` into `out` (cleared first); returns how many.
 size_t TakeWarmKeys(u32 core, std::vector<u64>& out, size_t max);
+
+/// EDEN_NX2_JIT_WARM_PERSIST=1 (with EDEN_NX2_JIT_WARM=1): the blocks the cores compiled in the
+/// game's own code are saved per game build, relative to the code base (the kernel moves it by up
+/// to 16 MiB each boot), every 5 minutes and at shutdown, and queued at the next boot for the cores
+/// that compiled them. Off by default.
+[[nodiscard]] bool JitWarmPersistEnabled();
+
+/// From the application's boot and shutdown: the JIT compile totals of the session go in the log
+/// every 5 minutes and at the end (with the time to the first present), with or without
+/// EDEN_NX2_JIT_WARM_PERSIST, so sessions can be compared.
+void BeginSession();
+void EndSession();
+
+/// At boot, after BeginSession, once the static modules are loaded at [code_base, code_base +
+/// code_size): loads `file` unless its layout fingerprint differs, queues its blocks and saves
+/// every 5 minutes until EndSession. Forgets the previous game's blocks.
+void BeginWarmPersist(const std::filesystem::path& file, u64 code_base, u64 code_size,
+                      u64 layout_fingerprint);
 
 /// From Common::SetCurrentThreadName: the thread's CPU time goes in the hitch line under `name`.
 void RegisterThread(const char* name);

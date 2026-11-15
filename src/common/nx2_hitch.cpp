@@ -2,11 +2,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <mutex>
+#include <numeric>
+#include <stop_token>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -140,6 +145,258 @@ std::mutex g_compile_mutex;
 std::unordered_map<u64, u8> g_compiled_on; ///< key -> mask of the cores that compiled it
 u8 g_cores_seen{};
 std::array<std::vector<u64>, 8> g_warm_queues;
+constexpr size_t WarmQueueCap = 400'000;
+
+// EDEN_NX2_JIT_WARM_PERSIST. A key is an A64 LocationDescriptor: PC in bits 0-55, FPCR mode bits
+// and the single-step bit above. Saved keys hold the PC as an offset from the code base.
+constexpr u64 PcMask = (u64{1} << 56) - 1;
+constexpr size_t PersistCap = 1'000'000; ///< 16 MiB; past it the least recently compiled go
+constexpr auto SaveInterval = std::chrono::minutes{5};
+constexpr u32 PersistVersion = 1;
+constexpr std::array<char, 8> PersistMagic{'F', 'R', 'J', 'I', 'T', 'W', 'P', '1'};
+
+struct PersistEntry {
+    u64 rel;       ///< key with the PC as an offset from the code base
+    u32 last_seen; ///< the last session a core compiled it on demand
+    u16 uses;      ///< sessions a core compiled it on demand
+    u8 mask;       ///< cores that compiled it on demand
+    u8 reserved;
+};
+static_assert(sizeof(PersistEntry) == 16);
+
+struct PersistHeader {
+    std::array<char, 8> magic;
+    u32 version;
+    u32 entry_size;
+    u64 layout_fingerprint;
+    u64 code_size;
+    u64 checksum; ///< of the entries
+    u32 session;
+    u32 count;
+};
+static_assert(sizeof(PersistHeader) == 48);
+
+struct Persist {
+    bool active{};
+    std::filesystem::path file;
+    u64 base{};
+    u64 size{};
+    u64 fingerprint{};
+    u32 session{};
+    std::vector<PersistEntry> entries;     ///< first-compile order
+    std::unordered_map<u64, u32> index{}; ///< key -> entries index
+};
+Persist g_persist; ///< under g_compile_mutex
+std::mutex g_save_mutex;
+std::jthread g_saver;
+std::mutex g_saver_mutex;
+std::condition_variable_any g_saver_cv;
+
+u64 Checksum(const std::vector<PersistEntry>& entries) {
+    u64 hash = 0xcbf29ce484222325ULL;
+    for (const PersistEntry& entry : entries) {
+        u64 words[2];
+        std::memcpy(words, &entry, sizeof(words));
+        hash = (hash ^ words[0]) * 0x100000001b3ULL;
+        hash = (hash ^ words[1]) * 0x100000001b3ULL;
+    }
+    return hash;
+}
+
+// Called with g_compile_mutex held, for on-demand compiles only: a warm compile says nothing
+// about whether the game still runs the block.
+void NotePersistLocked(u64 key, u8 bit) {
+    if (((key >> 57) & 1) != 0) {
+        return;
+    }
+    const u64 pc = key & PcMask;
+    if (pc - g_persist.base >= g_persist.size) {
+        return;
+    }
+    const auto [it, inserted] =
+        g_persist.index.try_emplace(key, static_cast<u32>(g_persist.entries.size()));
+    if (inserted) {
+        g_persist.entries.push_back(
+            {(pc - g_persist.base) | (key & ~PcMask), g_persist.session, 1, bit, 0});
+        return;
+    }
+    PersistEntry& entry = g_persist.entries[it->second];
+    entry.mask |= bit;
+    if (entry.last_seen != g_persist.session) {
+        entry.last_seen = g_persist.session;
+        if (entry.uses != 0xFFFF) {
+            ++entry.uses;
+        }
+    }
+}
+
+std::vector<PersistEntry> LoadPersistFile(const std::filesystem::path& file, u64 fingerprint,
+                                          u64 code_size, u32& session, std::string& problem) {
+    std::ifstream in{file, std::ios::binary};
+    if (!in) {
+        problem = "no file yet";
+        return {};
+    }
+    PersistHeader header{};
+    in.read(reinterpret_cast<char*>(&header), sizeof(header));
+    if (!in || header.magic != PersistMagic || header.version != PersistVersion ||
+        header.entry_size != sizeof(PersistEntry)) {
+        problem = "not a cache file of this version";
+        return {};
+    }
+    if (header.layout_fingerprint != fingerprint || header.code_size != code_size) {
+        problem = fmt::format("the module layout changed (fingerprint {:016X} -> {:016X}, code "
+                              "size {:#x} -> {:#x})",
+                              header.layout_fingerprint, fingerprint, header.code_size, code_size);
+        return {};
+    }
+    std::vector<PersistEntry> entries(header.count);
+    in.read(reinterpret_cast<char*>(entries.data()),
+            static_cast<std::streamsize>(entries.size() * sizeof(PersistEntry)));
+    if (!in || in.peek() != std::char_traits<char>::eof() ||
+        Checksum(entries) != header.checksum) {
+        problem = "truncated or corrupt";
+        return {};
+    }
+    session = header.session;
+    return entries;
+}
+
+void SavePersist() {
+    const std::scoped_lock save_lock{g_save_mutex};
+    std::vector<PersistEntry> entries;
+    std::filesystem::path file;
+    PersistHeader header{};
+    header.magic = PersistMagic;
+    header.version = PersistVersion;
+    header.entry_size = static_cast<u32>(sizeof(PersistEntry));
+    {
+        const std::scoped_lock lock{g_compile_mutex};
+        if (!g_persist.active) {
+            return;
+        }
+        entries = g_persist.entries;
+        file = g_persist.file;
+        header.layout_fingerprint = g_persist.fingerprint;
+        header.code_size = g_persist.size;
+        header.session = g_persist.session;
+    }
+    size_t dropped = 0;
+    if (entries.size() > PersistCap) {
+        // Keep the most recently compiled, then the most used; the kept ones stay in order.
+        std::vector<u32> rank(entries.size());
+        std::iota(rank.begin(), rank.end(), 0U);
+        std::ranges::nth_element(rank, rank.begin() + static_cast<std::ptrdiff_t>(PersistCap),
+                                 [&](u32 a, u32 b) {
+            const PersistEntry& x = entries[a];
+            const PersistEntry& y = entries[b];
+            if (x.last_seen != y.last_seen) {
+                return x.last_seen > y.last_seen;
+            }
+            return x.uses != y.uses ? x.uses > y.uses : a < b;
+        });
+        std::vector<bool> keep(entries.size());
+        for (size_t i = 0; i < PersistCap; ++i) {
+            keep[rank[i]] = true;
+        }
+        std::vector<PersistEntry> kept;
+        kept.reserve(PersistCap);
+        for (size_t i = 0; i < entries.size(); ++i) {
+            if (keep[i]) {
+                kept.push_back(entries[i]);
+            }
+        }
+        dropped = entries.size() - kept.size();
+        entries = std::move(kept);
+    }
+    header.count = static_cast<u32>(entries.size());
+    header.checksum = Checksum(entries);
+
+    // Written beside the file and renamed over it: a crash leaves the previous file whole.
+    std::error_code ec;
+    std::filesystem::create_directories(file.parent_path(), ec);
+    std::filesystem::path temp = file;
+    temp += ".tmp";
+    {
+        std::ofstream out{temp, std::ios::binary | std::ios::trunc};
+        out.write(reinterpret_cast<const char*>(&header), sizeof(header));
+        out.write(reinterpret_cast<const char*>(entries.data()),
+                  static_cast<std::streamsize>(entries.size() * sizeof(PersistEntry)));
+        out.flush();
+        if (!out) {
+            LOG_WARNING(Core_ARM, "JIT warm persist: cannot write {}", temp.string());
+            return;
+        }
+    }
+    std::filesystem::rename(temp, file, ec);
+    if (ec) {
+        LOG_WARNING(Core_ARM, "JIT warm persist: cannot replace {}: {}", file.string(),
+                    ec.message());
+        return;
+    }
+    LOG_INFO(Core_ARM, "JIT warm persist: saved {} blocks (session {}){}", entries.size(),
+             header.session,
+             dropped != 0 ? fmt::format(", dropped the {} least recently compiled", dropped)
+                          : "");
+}
+
+// Session totals: the three compile causes plus the presents' long gaps, from BeginSession.
+struct CompileTotals {
+    std::array<u64, 3> count{};
+    std::array<u64, 3> ns{};
+};
+constexpr std::array CompileCauses{Cause::Recompile, Cause::RecompileRepeat, Cause::WarmCompile};
+
+CompileTotals ReadCompileTotals() {
+    CompileTotals totals;
+    for (size_t i = 0; i < CompileCauses.size(); ++i) {
+        const auto cause = static_cast<size_t>(CompileCauses[i]);
+        totals.count[i] = g_counters.count[cause].load(std::memory_order_relaxed);
+        totals.ns[i] = g_counters.ns[cause].load(std::memory_order_relaxed);
+    }
+    return totals;
+}
+
+std::mutex g_session_mutex;
+CompileTotals g_session_start; ///< under g_session_mutex
+constexpr u64 SummaryIntervalNs =
+    static_cast<u64>(std::chrono::nanoseconds{SaveInterval}.count());
+std::atomic<u64> g_session_begin_ns{};
+std::atomic<u64> g_next_summary_ns{};
+std::atomic<bool> g_first_present_pending{};
+std::atomic<u64> g_hitch_count{};
+std::atomic<u64> g_hitch_us{};
+std::atomic<u64> g_hitch_longest_us{};
+
+void LogSessionTotals(std::string_view when) {
+    const u64 begin = g_session_begin_ns.load(std::memory_order_acquire);
+    if (begin == 0) {
+        return;
+    }
+    CompileTotals start;
+    {
+        const std::scoped_lock lock{g_session_mutex};
+        start = g_session_start;
+    }
+    const CompileTotals now = ReadCompileTotals();
+    size_t waiting = 0;
+    {
+        const std::scoped_lock lock{g_compile_mutex};
+        for (const auto& queue : g_warm_queues) {
+            waiting += queue.size();
+        }
+    }
+    const auto ms = [&](size_t i) { return static_cast<double>(now.ns[i] - start.ns[i]) / 1e6; };
+    const auto count = [&](size_t i) { return now.count[i] - start.count[i]; };
+    LOG_INFO(Core_ARM,
+             "JIT session totals {} ({:.1f} min): new game code {} compiles ({:.0f} ms), code "
+             "another core had {} ({:.0f} ms), warm compiles {} ({:.0f} ms), {} keys waiting to "
+             "be warmed; gaps over 50 ms between presents {} ({:.0f} ms, longest {:.0f} ms)",
+             when, static_cast<double>(NowNs() - begin) / 60e9, count(0), ms(0), count(1), ms(1),
+             count(2), ms(2), waiting, g_hitch_count.load(std::memory_order_relaxed),
+             static_cast<double>(g_hitch_us.load(std::memory_order_relaxed)) / 1e3,
+             static_cast<double>(g_hitch_longest_us.load(std::memory_order_relaxed)) / 1e3);
+}
 } // Anonymous namespace
 
 bool JitWarmEnabled() {
@@ -148,6 +405,107 @@ bool JitWarmEnabled() {
         return value != nullptr && value[0] == '1';
     }();
     return enabled;
+}
+
+bool JitWarmPersistEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_JIT_WARM_PERSIST");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+void BeginSession() {
+    {
+        const std::scoped_lock lock{g_session_mutex};
+        g_session_start = ReadCompileTotals();
+    }
+    g_hitch_count.store(0, std::memory_order_relaxed);
+    g_hitch_us.store(0, std::memory_order_relaxed);
+    g_hitch_longest_us.store(0, std::memory_order_relaxed);
+    const u64 now = NowNs();
+    g_next_summary_ns.store(now + SummaryIntervalNs, std::memory_order_relaxed);
+    g_first_present_pending.store(true, std::memory_order_relaxed);
+    g_session_begin_ns.store(now, std::memory_order_release);
+}
+
+void BeginWarmPersist(const std::filesystem::path& file, u64 code_base, u64 code_size,
+                      u64 layout_fingerprint) {
+    u32 last_session = 0;
+    std::string problem;
+    std::vector<PersistEntry> loaded =
+        LoadPersistFile(file, layout_fingerprint, code_size, last_session, problem);
+    size_t queued = 0;
+    size_t loaded_count = 0;
+    {
+        const std::scoped_lock lock{g_compile_mutex};
+        // A new process: its JITs start empty, and the last game's keys mean nothing here.
+        g_compiled_on.clear();
+        g_cores_seen = 0;
+        for (auto& queue : g_warm_queues) {
+            queue.clear();
+        }
+        g_persist = {};
+        g_persist.file = file;
+        g_persist.base = code_base;
+        g_persist.size = code_size;
+        g_persist.fingerprint = layout_fingerprint;
+        g_persist.session = last_session + 1;
+        g_persist.entries = std::move(loaded);
+        g_persist.index.reserve(g_persist.entries.size());
+        for (u32 i = 0; i < g_persist.entries.size(); ++i) {
+            const PersistEntry& entry = g_persist.entries[i];
+            const u64 offset = entry.rel & PcMask;
+            if (offset >= code_size) {
+                continue;
+            }
+            const u64 key = (code_base + offset) | (entry.rel & ~PcMask);
+            g_persist.index.emplace(key, i);
+            for (u32 core = 0; core < 8; ++core) {
+                if ((entry.mask >> core) & 1) {
+                    if (g_warm_queues[core].size() < WarmQueueCap) {
+                        g_warm_queues[core].push_back(key);
+                        ++queued;
+                    }
+                }
+            }
+        }
+        loaded_count = g_persist.entries.size();
+        g_persist.active = true;
+    }
+    if (problem.empty()) {
+        LOG_INFO(Core_ARM,
+                 "JIT warm persist: {} blocks from {} (session {}), {} queued for the cores that "
+                 "compiled them; game code at {:#x}, {} KiB",
+                 loaded_count, file.string(), last_session + 1, queued, code_base,
+                 code_size >> 10);
+    } else {
+        LOG_INFO(Core_ARM, "JIT warm persist: starting empty, {}: {} (game code at {:#x}, {} KiB)",
+                 problem, file.string(), code_base, code_size >> 10);
+    }
+    g_saver = std::jthread([](std::stop_token stop) {
+        std::unique_lock lock{g_saver_mutex};
+        while (!g_saver_cv.wait_for(lock, stop, SaveInterval, [] { return false; }) &&
+               !stop.stop_requested()) {
+            lock.unlock();
+            SavePersist();
+            lock.lock();
+        }
+    });
+}
+
+void EndSession() {
+    if (g_saver.joinable()) {
+        g_saver.request_stop();
+        g_saver.join();
+    }
+    SavePersist();
+    {
+        const std::scoped_lock lock{g_compile_mutex};
+        g_persist = {};
+    }
+    LogSessionTotals("at the end");
+    g_session_begin_ns.store(0, std::memory_order_release);
 }
 
 Cause CompileCause(u64 key, u32 core) {
@@ -160,12 +518,15 @@ Cause CompileCause(u64 key, u32 core) {
     if (t_warming) {
         return Cause::WarmCompile;
     }
+    if (g_persist.active) {
+        NotePersistLocked(key, bit);
+    }
     // Single-stepping blocks (bit 57 of an A64 LocationDescriptor) are never worth warming.
     if (JitWarmEnabled() && ((key >> 57) & 1) == 0) {
         for (u32 other = 0; other < 8; ++other) {
             const u8 other_bit = static_cast<u8>(1U << other);
             if ((g_cores_seen & other_bit) != 0 && (mask & other_bit) == 0 &&
-                g_warm_queues[other].size() < 400'000) {
+                g_warm_queues[other].size() < WarmQueueCap) {
                 g_warm_queues[other].push_back(key);
             }
         }
@@ -222,6 +583,25 @@ void OnPresent(long long gap_us) {
     static int lines_in_window = 0;
     if (!Enabled()) {
         return;
+    }
+    if (const u64 begin = g_session_begin_ns.load(std::memory_order_acquire); begin != 0) {
+        const u64 now_ns = NowNs();
+        if (g_first_present_pending.exchange(false, std::memory_order_relaxed)) {
+            LOG_INFO(Core_ARM, "JIT session: first present {:.2f} s after boot",
+                     static_cast<double>(now_ns - begin) / 1e9);
+        }
+        if (gap_us >= ThresholdUs) {
+            const auto gap = static_cast<u64>(gap_us);
+            g_hitch_count.fetch_add(1, std::memory_order_relaxed);
+            g_hitch_us.fetch_add(gap, std::memory_order_relaxed);
+            if (gap > g_hitch_longest_us.load(std::memory_order_relaxed)) {
+                g_hitch_longest_us.store(gap, std::memory_order_relaxed);
+            }
+        }
+        if (now_ns >= g_next_summary_ns.load(std::memory_order_relaxed)) {
+            g_next_summary_ns.store(now_ns + SummaryIntervalNs, std::memory_order_relaxed);
+            LogSessionTotals("so far");
+        }
     }
     const Snapshot now = Take();
     if (gap_us >= ThresholdUs) {

@@ -5,13 +5,17 @@
 #include <cstdlib>
 #include <atomic>
 #include <memory>
+#include <span>
 #include <utility>
 
 #include "game_settings.h"
 #include "common/cpu_features.h"
 #include "audio_core/audio_core.h"
 #include "common/fs/fs.h"
+#include "common/fs/path_util.h"
+#include "common/hex_util.h"
 #include "common/logging.h"
+#include "common/nx2_hitch.h"
 #include "common/nx2_sampler.h"
 #include "common/adpf.h"
 #include "common/settings.h"
@@ -184,6 +188,44 @@ bool IsSwitch2Program(const FileSys::VirtualFile& file, u64 program_id, std::siz
     const auto npdm = dir != nullptr ? dir->GetFile("main.npdm") : nullptr;
     return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
            metadata.IsSwitch2();
+}
+
+// EDEN_NX2_JIT_WARM_PERSIST: the blocks compiled in earlier sessions of this build. Saved blocks
+// are offsets from the code base, so the file also keys on the static modules' layout (names,
+// offsets and sizes, in load order).
+void StartJitWarmPersist(System& system, Loader::AppLoader& loader, Kernel::KProcess& process,
+                         u64 program_id) {
+    if (!process.Is64Bit()) {
+        return;
+    }
+    Loader::AppLoader::Modules modules;
+    if (loader.ReadNSOModules(modules) != Loader::ResultStatus::Success || modules.empty()) {
+        LOG_INFO(Core_ARM, "JIT warm persist: no module list for this program, off");
+        return;
+    }
+    const u64 base = GetInteger(process.GetEntryPoint());
+    const u64 size = process.GetCodeSize();
+    u64 fingerprint = 0xcbf29ce484222325ULL;
+    const auto mix = [&fingerprint](std::span<const u8> bytes) {
+        for (const u8 byte : bytes) {
+            fingerprint = (fingerprint ^ byte) * 0x100000001b3ULL;
+        }
+    };
+    const auto mix_u64 = [&mix](u64 value) {
+        mix({reinterpret_cast<const u8*>(&value), sizeof(value)});
+    };
+    for (auto it = modules.begin(); it != modules.end(); ++it) {
+        const auto next = std::next(it);
+        const u64 end = next != modules.end() ? next->first : base + size;
+        mix({reinterpret_cast<const u8*>(it->second.data()), it->second.size() + 1});
+        mix_u64(it->first - base);
+        mix_u64(end - it->first);
+    }
+    mix_u64(size);
+    const auto file = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir) / "jit_warm" /
+                      fmt::format("{:016X}_{}.bin", program_id,
+                                  Common::HexToString(system.GetApplicationProcessBuildID()));
+    Common::Nx2Hitch::BeginWarmPersist(file, base, size, fingerprint);
 }
 
 } // namespace
@@ -457,6 +499,11 @@ struct System::Impl {
         // Make the process created be the application
         kernel.SetApplicationProcess(process->GetHandle());
 
+        Common::Nx2Hitch::BeginSession();
+        if (Common::Nx2Hitch::JitWarmEnabled() && Common::Nx2Hitch::JitWarmPersistEnabled()) {
+            StartJitWarmPersist(system, *app_loader, *process->GetHandle(), params.program_id);
+        }
+
         // Set up the rest of the system.
         SystemResultStatus init_result{SetupForApplicationProcess(system, emu_window)};
         if (init_result != SystemResultStatus::Success) {
@@ -557,6 +604,7 @@ struct System::Impl {
         // Common::ShutdownProgress); the GPU's (pipeline caches) reports its own steps.
         Common::NoteShutdownProgress();
         kernel.ShutdownCores();
+        Common::Nx2Hitch::EndSession(); // the cores compile nothing more
         Common::NoteShutdownProgress();
         services.reset();
         service_manager.reset();
