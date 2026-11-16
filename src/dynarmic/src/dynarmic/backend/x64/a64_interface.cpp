@@ -239,19 +239,19 @@ private:
     }
 
 public:
-    bool PrecompileBlock(u64 location) {
+    Jit::PrecompileResult PrecompileBlock(u64 location) {
         if (is_executing) {
-            return false;
+            return Jit::PrecompileResult::Skipped;
         }
         const IR::LocationDescriptor descriptor{location};
         if (emitter.GetBasicBlock(descriptor)) {
-            return false;
+            return Jit::PrecompileResult::Skipped;
         }
         if (block_of_code.SpaceRemaining() < (size_t{256} << 20)) {
-            return false;
+            return Jit::PrecompileResult::NoSpace;
         }
         static_cast<void>(GetBlock(descriptor));
-        return true;
+        return Jit::PrecompileResult::Compiled;
     }
 
 private:
@@ -337,7 +337,7 @@ void Jit::ClearCache() {
     impl->ClearCache();
 }
 
-bool Jit::PrecompileBlock(u64 location) {
+Jit::PrecompileResult Jit::PrecompileBlock(u64 location) {
     return impl->PrecompileBlock(location);
 }
 

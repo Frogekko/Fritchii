@@ -192,8 +192,8 @@ void Jit::ClearCache() {
     impl->ClearCache();
 }
 
-bool Jit::PrecompileBlock(std::uint64_t) {
-    return false; // Fritchii's warm-up is x64 only
+Jit::PrecompileResult Jit::PrecompileBlock(std::uint64_t) {
+    return PrecompileResult::Skipped; // Fritchii's warm-up is x64 only
 }
 
 void Jit::InvalidateCacheRange(u64 start_address, size_t length) {

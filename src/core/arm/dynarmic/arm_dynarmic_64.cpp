@@ -579,7 +579,10 @@ std::size_t ArmDynarmic64::WarmCompile(std::span<const u64> keys, const std::ato
         if (stop.load(std::memory_order_acquire)) {
             break;
         }
-        static_cast<void>(m_jit->PrecompileBlock(key));
+        if (m_jit->PrecompileBlock(key) == Dynarmic::A64::Jit::PrecompileResult::NoSpace) {
+            Common::Nx2Hitch::WarmOutOfSpace(static_cast<u32>(m_core_index));
+            break;
+        }
         ++done;
     }
     Common::Nx2Hitch::t_warming = false;

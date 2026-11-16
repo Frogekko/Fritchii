@@ -338,7 +338,11 @@ void PhysicalCore::Idle(KernelCore& kernel) {
             if (auto* const arm = process->GetArmInterface(m_core_index)) {
                 using Clock = std::chrono::steady_clock;
                 constexpr auto Window = std::chrono::milliseconds{100};
-                constexpr auto Budget = std::chrono::milliseconds{20};
+                // Before the first present with a saved set queued (EDEN_NX2_JIT_WARM_PERSIST),
+                // 80 ms: at 20 ms each core warmed ~2% of the time and ~3M saved keys were still
+                // waiting when the save loaded (2026-11-16). Nothing is drawn yet to slow down.
+                const auto Budget = std::chrono::milliseconds{
+                    Common::Nx2Hitch::WarmBoost() ? 80 : 20};
                 thread_local std::vector<u64> keys;
                 thread_local Clock::time_point window_start{};
                 thread_local Clock::duration used{};

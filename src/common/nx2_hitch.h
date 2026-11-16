@@ -137,10 +137,19 @@ inline void AddLockWait(u64 ns) {
 /// Moves up to `max` queued keys for `core` into `out` (cleared first); returns how many.
 size_t TakeWarmKeys(u32 core, std::vector<u64>& out, size_t max);
 
+/// True from a boot that queued a saved warm set until the game's first present: idle cores may
+/// then warm for longer (PhysicalCore::Idle).
+[[nodiscard]] bool WarmBoost();
+
+/// From a core whose JIT refused a warm compile for lack of code space: that core warms nothing
+/// more this session (its queue is dropped, logged once).
+void WarmOutOfSpace(u32 core);
+
 /// EDEN_NX2_JIT_WARM_PERSIST=1 (with EDEN_NX2_JIT_WARM=1): the blocks the cores compiled in the
 /// game's own code are saved per game build, relative to the code base (the kernel moves it by up
-/// to 16 MiB each boot), every 5 minutes and at shutdown, and queued at the next boot for the cores
-/// that compiled them. Off by default.
+/// to 16 MiB each boot), every 5 minutes and at shutdown, and queued at the next boot for every
+/// core the game ran code on: the guest's threads land on different cores each session.
+/// Off by default.
 [[nodiscard]] bool JitWarmPersistEnabled();
 
 /// From the application's boot and shutdown: the JIT compile totals of the session go in the log

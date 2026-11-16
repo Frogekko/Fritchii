@@ -51,13 +51,15 @@ public:
      */
     void InvalidateCacheRange(std::uint64_t start_address, std::size_t length);
 
+    enum class PrecompileResult { Compiled, Skipped, NoSpace };
+
     /**
      * Fritchii: compiles the block `location` (an IR::LocationDescriptor value another JIT ran)
      * without running it, so this JIT has it before the game needs it here. Only between runs,
-     * from the thread that runs this JIT. Returns whether it compiled one (false: already there,
-     * running, or under 256 MiB of code space left, where a full cache would be thrown away).
+     * from the thread that runs this JIT. Skipped: already there or running. NoSpace: under
+     * 256 MiB of code space left, where a full cache would be thrown away.
      */
-    bool PrecompileBlock(std::uint64_t location);
+    PrecompileResult PrecompileBlock(std::uint64_t location);
 
     /**
      * Reset CPU state to state at startup. Does not clear code cache.

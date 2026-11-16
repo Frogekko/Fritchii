@@ -144,8 +144,28 @@ namespace {
 std::mutex g_compile_mutex;
 std::unordered_map<u64, u8> g_compiled_on; ///< key -> mask of the cores that compiled it
 u8 g_cores_seen{};
-std::array<std::vector<u64>, 8> g_warm_queues;
-constexpr size_t WarmQueueCap = 400'000;
+// Taken from `head`: erasing 16 keys from the front of an 800k-key vector moved ~6 MiB under
+// g_compile_mutex, which every on-demand compile on every core waits for (2026-11-16).
+struct WarmLane {
+    std::vector<u64> keys;
+    size_t head{};
+    size_t Size() const {
+        return keys.size() - head;
+    }
+};
+// `fresh` (what another core compiled this session, so the game runs it now) goes before `saved`
+// (the persisted set): behind 800k saved keys it waited minutes (review, 2026-11-16).
+struct WarmQueue {
+    WarmLane fresh;
+    WarmLane saved;
+    size_t Size() const {
+        return fresh.Size() + saved.Size();
+    }
+};
+std::array<WarmQueue, 8> g_warm_queues;
+std::atomic<bool> g_warm_boost{}; ///< a saved set is queued and nothing was presented yet
+constexpr size_t WarmQueueCap = 1'200'000; ///< a saved set (up to PersistCap) plus new code
+u8 g_warm_full{}; ///< cores whose JIT refused a warm compile for lack of code space
 
 // EDEN_NX2_JIT_WARM_PERSIST. A key is an A64 LocationDescriptor: PC in bits 0-55, FPCR mode bits
 // and the single-step bit above. Saved keys hold the PC as an offset from the code base.
@@ -188,9 +208,9 @@ struct Persist {
 };
 Persist g_persist; ///< under g_compile_mutex
 std::mutex g_save_mutex;
-std::jthread g_saver;
 std::mutex g_saver_mutex;
 std::condition_variable_any g_saver_cv;
+std::jthread g_saver; ///< after what it waits on, so an exit without EndSession joins it first
 
 u64 Checksum(const std::vector<PersistEntry>& entries) {
     u64 hash = 0xcbf29ce484222325ULL;
@@ -248,6 +268,11 @@ std::vector<PersistEntry> LoadPersistFile(const std::filesystem::path& file, u64
         problem = fmt::format("the module layout changed (fingerprint {:016X} -> {:016X}, code "
                               "size {:#x} -> {:#x})",
                               header.layout_fingerprint, fingerprint, header.code_size, code_size);
+        return {};
+    }
+    if (header.count > PersistCap) {
+        // The header has no checksum: a damaged count would ask for up to 64 GiB.
+        problem = "truncated or corrupt";
         return {};
     }
     std::vector<PersistEntry> entries(header.count);
@@ -380,20 +405,23 @@ void LogSessionTotals(std::string_view when) {
     }
     const CompileTotals now = ReadCompileTotals();
     size_t waiting = 0;
+    u8 full = 0;
     {
         const std::scoped_lock lock{g_compile_mutex};
         for (const auto& queue : g_warm_queues) {
-            waiting += queue.size();
+            waiting += queue.Size();
         }
+        full = g_warm_full;
     }
     const auto ms = [&](size_t i) { return static_cast<double>(now.ns[i] - start.ns[i]) / 1e6; };
     const auto count = [&](size_t i) { return now.count[i] - start.count[i]; };
     LOG_INFO(Core_ARM,
              "JIT session totals {} ({:.1f} min): new game code {} compiles ({:.0f} ms), code "
              "another core had {} ({:.0f} ms), warm compiles {} ({:.0f} ms), {} keys waiting to "
-             "be warmed; gaps over 50 ms between presents {} ({:.0f} ms, longest {:.0f} ms)",
+             "be warmed, cores out of warm code space {:#04x}; gaps over 50 ms between presents "
+             "{} ({:.0f} ms, longest {:.0f} ms)",
              when, static_cast<double>(NowNs() - begin) / 60e9, count(0), ms(0), count(1), ms(1),
-             count(2), ms(2), waiting, g_hitch_count.load(std::memory_order_relaxed),
+             count(2), ms(2), waiting, full, g_hitch_count.load(std::memory_order_relaxed),
              static_cast<double>(g_hitch_us.load(std::memory_order_relaxed)) / 1e3,
              static_cast<double>(g_hitch_longest_us.load(std::memory_order_relaxed)) / 1e3);
 }
@@ -435,15 +463,20 @@ void BeginWarmPersist(const std::filesystem::path& file, u64 code_base, u64 code
     std::string problem;
     std::vector<PersistEntry> loaded =
         LoadPersistFile(file, layout_fingerprint, code_size, last_session, problem);
+    size_t queued_own = 0;
     size_t queued = 0;
     size_t loaded_count = 0;
+    u8 cores = 0;
     {
         const std::scoped_lock lock{g_compile_mutex};
         // A new process: its JITs start empty, and the last game's keys mean nothing here.
         g_compiled_on.clear();
+        // Sized now: growing to ~1M keys rehashes several times under every compile's lock.
+        g_compiled_on.reserve(loaded.size() + loaded.size() / 4);
         g_cores_seen = 0;
+        g_warm_full = 0;
         for (auto& queue : g_warm_queues) {
-            queue.clear();
+            queue = {};
         }
         g_persist = {};
         g_persist.file = file;
@@ -452,20 +485,34 @@ void BeginWarmPersist(const std::filesystem::path& file, u64 code_base, u64 code
         g_persist.fingerprint = layout_fingerprint;
         g_persist.session = last_session + 1;
         g_persist.entries = std::move(loaded);
+        g_persist.entries.reserve(g_persist.entries.size() + 65536); // new blocks: no 13 MiB copy
         g_persist.index.reserve(g_persist.entries.size());
-        for (u32 i = 0; i < g_persist.entries.size(); ++i) {
-            const PersistEntry& entry = g_persist.entries[i];
-            const u64 offset = entry.rel & PcMask;
-            if (offset >= code_size) {
-                continue;
-            }
-            const u64 key = (code_base + offset) | (entry.rel & ~PcMask);
-            g_persist.index.emplace(key, i);
-            for (u32 core = 0; core < 8; ++core) {
-                if ((entry.mask >> core) & 1) {
-                    if (g_warm_queues[core].size() < WarmQueueCap) {
-                        g_warm_queues[core].push_back(key);
-                        ++queued;
+        for (const PersistEntry& entry : g_persist.entries) {
+            cores |= entry.mask;
+        }
+        // Every block goes to every core the game ran code on, not only the ones that compiled
+        // it: per-core queues left ~1.1M compiles of code another core had (2026-11-15), as the
+        // guest's threads land on different cores each session. First the cores that compiled
+        // it, then the others: with every core warming the same keys in the same order, the
+        // save-load code was still unwarmed when the game ran it (new-code compiles 364k ->
+        // 651k in the first 5 minutes, 14 -> 57 s of gaps, 2026-11-16). First-compile order
+        // within each pass, so the boot and save-load code comes first.
+        for (const bool own : {true, false}) {
+            for (u32 i = 0; i < g_persist.entries.size(); ++i) {
+                const PersistEntry& entry = g_persist.entries[i];
+                const u64 offset = entry.rel & PcMask;
+                if (offset >= code_size) {
+                    continue;
+                }
+                const u64 key = (code_base + offset) | (entry.rel & ~PcMask);
+                if (own) {
+                    g_persist.index.emplace(key, i);
+                }
+                const u8 targets = own ? entry.mask : static_cast<u8>(cores & ~entry.mask);
+                for (u32 core = 0; core < 8; ++core) {
+                    if (((targets >> core) & 1) != 0 && g_warm_queues[core].Size() < WarmQueueCap) {
+                        g_warm_queues[core].saved.keys.push_back(key);
+                        ++(own ? queued_own : queued);
                     }
                 }
             }
@@ -473,12 +520,14 @@ void BeginWarmPersist(const std::filesystem::path& file, u64 code_base, u64 code
         loaded_count = g_persist.entries.size();
         g_persist.active = true;
     }
+    g_warm_boost.store(queued_own + queued != 0, std::memory_order_relaxed);
     if (problem.empty()) {
         LOG_INFO(Core_ARM,
                  "JIT warm persist: {} blocks from {} (session {}), {} queued for the cores that "
-                 "compiled them; game code at {:#x}, {} KiB",
-                 loaded_count, file.string(), last_session + 1, queued, code_base,
-                 code_size >> 10);
+                 "compiled them, then {} for the other cores of {:#04x}; game code at {:#x}, "
+                 "{} KiB",
+                 loaded_count, file.string(), last_session + 1, queued_own, queued, cores,
+                 code_base, code_size >> 10);
     } else {
         LOG_INFO(Core_ARM, "JIT warm persist: starting empty, {}: {} (game code at {:#x}, {} KiB)",
                  problem, file.string(), code_base, code_size >> 10);
@@ -495,6 +544,7 @@ void BeginWarmPersist(const std::filesystem::path& file, u64 code_base, u64 code
 }
 
 void EndSession() {
+    g_warm_boost.store(false, std::memory_order_relaxed);
     if (g_saver.joinable()) {
         g_saver.request_stop();
         g_saver.join();
@@ -526,8 +576,8 @@ Cause CompileCause(u64 key, u32 core) {
         for (u32 other = 0; other < 8; ++other) {
             const u8 other_bit = static_cast<u8>(1U << other);
             if ((g_cores_seen & other_bit) != 0 && (mask & other_bit) == 0 &&
-                g_warm_queues[other].size() < WarmQueueCap) {
-                g_warm_queues[other].push_back(key);
+                (g_warm_full & other_bit) == 0 && g_warm_queues[other].Size() < WarmQueueCap) {
+                g_warm_queues[other].fresh.keys.push_back(key);
             }
         }
     }
@@ -536,19 +586,53 @@ Cause CompileCause(u64 key, u32 core) {
 
 size_t TakeWarmKeys(u32 core, std::vector<u64>& out, size_t max) {
     out.clear();
-    std::scoped_lock lock{g_compile_mutex};
-    auto& queue = g_warm_queues[core & 7];
     const u8 bit = static_cast<u8>(1U << (core & 7));
-    // Oldest first; skip keys this core compiled on demand meanwhile.
-    size_t taken = 0;
-    while (taken < queue.size() && out.size() < max) {
-        const u64 key = queue[taken++];
-        if ((g_compiled_on[key] & bit) == 0) {
-            out.push_back(key);
+    // Oldest first; skip keys this core compiled on demand meanwhile. A core that ran the boot
+    // or a load on demand has runs of 100k+ such keys in a saved set: the lock is dropped every
+    // 1024 keys and the call gives up after 16384, so no compile waits long behind the scan.
+    for (size_t scanned = 0; scanned < 16384;) {
+        std::scoped_lock lock{g_compile_mutex};
+        auto& queue = g_warm_queues[core & 7];
+        WarmLane& lane = queue.fresh.Size() != 0 ? queue.fresh : queue.saved;
+        const size_t stop = scanned + 1024;
+        while (lane.head < lane.keys.size() && out.size() < max && scanned < stop) {
+            const u64 key = lane.keys[lane.head++];
+            ++scanned;
+            if ((g_compiled_on[key] & bit) == 0) {
+                out.push_back(key);
+            }
+        }
+        if (lane.head == lane.keys.size()) {
+            lane = {};
+        } else if (lane.head >= 65536 && lane.head * 2 >= lane.keys.size()) {
+            lane.keys.erase(lane.keys.begin(),
+                            lane.keys.begin() + static_cast<std::ptrdiff_t>(lane.head));
+            lane.head = 0;
+        }
+        if (queue.Size() == 0 || out.size() >= max) {
+            break;
         }
     }
-    queue.erase(queue.begin(), queue.begin() + static_cast<std::ptrdiff_t>(taken));
     return out.size();
+}
+
+void WarmOutOfSpace(u32 core) {
+    const u8 bit = static_cast<u8>(1U << (core & 7));
+    size_t dropped = 0;
+    {
+        std::scoped_lock lock{g_compile_mutex};
+        if ((g_warm_full & bit) != 0) {
+            return;
+        }
+        g_warm_full |= bit;
+        auto& queue = g_warm_queues[core & 7];
+        dropped = queue.Size();
+        queue = {};
+    }
+    LOG_INFO(Core_ARM,
+             "JIT warm: core {} has under 256 MiB of code space left, so it stops warming; "
+             "dropped {} queued keys",
+             core, dropped);
 }
 
 void RegisterThread(const char* name) {
@@ -577,10 +661,17 @@ void RegisterThread(const char* name) {
 #endif
 }
 
+bool WarmBoost() {
+    return g_warm_boost.load(std::memory_order_relaxed);
+}
+
 void OnPresent(long long gap_us) {
     static Snapshot last = Take();
     static u64 window_start_ns = NowNs();
     static int lines_in_window = 0;
+    if (g_warm_boost.load(std::memory_order_relaxed)) {
+        g_warm_boost.store(false, std::memory_order_relaxed);
+    }
     if (!Enabled()) {
         return;
     }
@@ -589,6 +680,7 @@ void OnPresent(long long gap_us) {
         if (g_first_present_pending.exchange(false, std::memory_order_relaxed)) {
             LOG_INFO(Core_ARM, "JIT session: first present {:.2f} s after boot",
                      static_cast<double>(now_ns - begin) / 1e9);
+            LogSessionTotals("at the first present"); // how much warmed before a frame showed
         }
         if (gap_us >= ThresholdUs) {
             const auto gap = static_cast<u64>(gap_us);
